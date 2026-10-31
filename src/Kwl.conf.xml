@@ -1,0 +1,19 @@
+<?xml version="1.0" encoding="utf-8"?>
+<KNX xmlns="http://knx.org/xml/project/20" xmlns:op="http://github.com/OpenKNX/OpenKNXproducer">
+
+  <!-- Versionsstaende der eingebundenen Module. Der Producer vergleicht sie gegen die
+       library.json des jeweiligen Repos und bricht bei Abweichung ab. -->
+  <op:config name="%BASE_VerifyVersion%" value="1.9" />
+
+  <!-- Applikationsversion des Geraets. ReplacesVersions listet bewusst NUR die eigene
+       Version: es gibt keine Vorgaengerapplikation, aus der die ETS migrieren koennte,
+       und das Attribut ist nicht weglassbar - der Producer erzwingt es. -->
+  <op:config name="%ReleaseApplicationVersion%" value="0.6" />
+  <op:config name="%ReleaseReplacesVersions%" value="0.5 0.4 0.3 0.2 0.1" />
+
+  <!-- Vorbelegung der Info-LED-Auswahl: Info-LED 1 zeigt Lueftung, nur Stoerungen" 
+       (111, PT-SLEDFunc in Fan.share.xml, im Modul kLedFunctionFaultsOnly). 
+       Die uebrigen Info-LEDs bleiben auf der Vorgabe aus Common.share.xml. -->
+  <op:config name="%BASE_Info1LedFunc%" value="111" />
+
+</KNX>

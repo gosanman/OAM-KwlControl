@@ -1,0 +1,600 @@
+"""Selbsttest des Simulators: ein paar Inbetriebnahme-Abläufe, ohne Oberfläche.
+
+Prüft, dass der Kern den echten Firmware-Code ausführt und die Ausgänge so
+liefert, wie die Applikationsbeschreibung es erwartet. Läuft nach dem
+Bauen:  python sim/selftest.py
+"""
+
+import sys
+
+from kwlcore import Core, ParamImage, load_meta
+
+FAILS = []
+
+
+def check(label, cond, detail=''):
+    print(('  ok    ' if cond else '  FEHLER ') + label + (f'  [{detail}]' if detail else ''))
+    if not cond:
+        FAILS.append(label)
+
+
+def aufbau_b(meta):
+    """Vorbereitung: Aufbau B (beide Lüfter in Verbund 1)."""
+    img = ParamImage(meta)
+    for n, v in {
+        'FAN_Hardware': 1, 'BASE_Info1LedFunc': 110,
+        'ROOM_r1Active': 1, 'ROOM_r2Active': 1,
+        'FAN_Grp1Active': 1,
+        'FAN_f1Active': 1, 'FAN_f1Type': 0, 'FAN_f1Channel': 1, 'FAN_f1Room': 1,
+        'FAN_f1Group': 1, 'FAN_f1Phase': 0,
+        'FAN_f2Active': 1, 'FAN_f2Type': 0, 'FAN_f2Channel': 2, 'FAN_f2Room': 2,
+        'FAN_f2Group': 1, 'FAN_f2Phase': 1,
+    }.items():
+        img.set(n, v)
+    return img
+
+
+def project_image(meta, name):
+    import json, os
+    with open(os.path.join(os.path.dirname(__file__), 'projects', name + '.json'), encoding='utf-8') as f:
+        img = ParamImage(meta)
+        img.load_values(json.load(f)['values'])
+    return img
+
+
+def ego_summer(meta):
+    """Telegrammsturm: ego ohne WRG im Takt darf seinen Status nicht in jeder Schleife senden."""
+    print('9. ego im Sommerzyklus (Telegrammsturm)')
+    sent = []
+    core = Core(on_event=lambda ev: sent.append(ev) if ev.get('ev') == 'ko' else None)
+    core.cmd('load ' + project_image(meta, 'Bad mit ego + e2 60-Paar').hex())
+    core.cmd('v12 1')
+    core.cmd('bus 1')
+    core.cmd('run 2000')
+    core.cmd('ko 30 1.1 1')          # Raum 1 (Bad): Sommer -> langer Zyklus, keine WRG
+    core.cmd('run 1000')
+    sent.clear()
+    core.cmd('run 600000')           # 10 min
+    ego = [e for e in sent if 340 <= e['nr'] < 364]
+    check('Lüfter 1 (ego) sendet in 10 min höchstens 20 Telegramme', len(ego) <= 20, f'{len(ego)} Telegramme')
+    core.close()
+
+
+def ego_boost(meta):
+    """Abluftstoss des ego nur ueber die Totzeit bei 5,00 V."""
+    print('10. Abluftstoß des ego aus dem Pendeln (Totzeit je Kanal)')
+    warns = []
+    core = Core(on_event=lambda ev: warns.append(ev) if ev.get('ev') == 'warn' else None)
+    core.cmd('load ' + project_image(meta, 'Bad mit ego + e2 60-Paar').hex())
+    core.cmd('v12 1')
+    core.cmd('bus 1')
+    core.cmd('run 5000')
+    core.cmd('ko 26 5.100 1')         # Bad: Handstufe 1, der ego pendelt
+    for _ in range(3):                 # ueber mehrere Pendelwechsel
+        core.cmd('run 40000')
+        core.cmd('ko 32 1.3 1')        # Abluftanforderung (10 s Vorlauf)
+        core.cmd('run 20000')
+        core.cmd('ko 32 1.3 0')
+        core.cmd('run 70000')          # Nachlauf 1 min, zurueck ins Pendeln
+    i5 = [w for w in warns if w['inv'] == 'Invariante 5']
+    check('kein Richtungswechsel ohne Totzeit am ego', not i5, [w['text'] for w in i5][:2])
+    core.cmd('ko 32 1.3 1')
+    core.cmd('run 15000')
+    fan = core.state()['sim']['fans'][0]
+    check('ego erreicht Stufe 4 (Abluftstoß)', fan['stage'] == 4, fan['stage'])
+    core.close()
+
+
+def polarity(meta):
+    """Polaritaet je Luefter: Standard ueber 5 V Zuluft, umkehrbar je Luefter."""
+    print('11. Polarität je Lüfter')
+    img = aufbau_b(meta)
+    for n, v in {'FAN_Grp2Active': 1, 'FAN_f2Group': 2,   # je ein eigener Verbund
+                 'FAN_f1Polarity': 0, 'FAN_f2Polarity': 1}.items():
+        img.set(n, v)
+    core = Core()
+    core.cmd('load ' + img.hex())
+    core.cmd('v12 1')
+    core.cmd('bus 1')
+    core.cmd('run 5000')
+    for ko_stage, ko_dir in ((26, 31), (66, 71)):        # Raum 1 und 2: Stufe 2, nur Zuluft
+        core.cmd(f'ko {ko_stage} 5.100 2')
+        core.cmd(f'ko {ko_dir} 5.010 2')
+    core.cmd('run 15000')             # Rampe ab, Totzeit, Rampe auf
+    st = core.state()['sim']
+    f1, f2 = st['fans'][0], st['fans'][1]
+    v1, v2 = st['dac'][0]['volt'], st['dac'][1]['volt']
+    check('Lüfter 1, Standard: Zuluft über 5 V', f1['dir'] == 'Zuluft' and abs(v1 - 6.91) < 0.05,
+          (f1['dir'], v1, f1['below5vSupply']))
+    check('Lüfter 2, umgekehrt: Zuluft unter 5 V', f2['dir'] == 'Zuluft' and abs(v2 - 3.21) < 0.05,
+          (f2['dir'], v2, f2['below5vSupply']))
+    core.close()
+
+
+def without_group(meta):
+    """Jeder Luefter braucht einen aktiven Verbund."""
+    print('12. Lüfter ohne aktiven Verbund')
+    img = aufbau_b(meta)
+    img.set('FAN_f2Group', 3)                              # Verbund 3 ist nicht aktiv
+    core = Core()
+    core.cmd('load ' + img.hex())
+    core.cmd('v12 1')
+    core.cmd('bus 1')
+    core.cmd('run 5000')
+    core.cmd('ko 66 5.100 3')                              # Raum 2 will Stufe 3
+    core.cmd('run 5000')
+    st = core.state()['sim']
+    check('Lüfter 2: Fehlercode 3', st['fans'][1]['err'] == 3, st['fans'][1]['err'])
+    check('Lüfter 2: S2 auf 5,00 V', abs(st['dac'][1]['volt'] - 5.0) < 0.02, st['dac'][1])
+    check('Lüfter 1 nicht betroffen (Verbund 1)', st['fans'][0]['err'] != 3, st['fans'][0]['err'])
+    core.close()
+
+
+def panel_polarity(meta):
+    """Polaritaet der Bedienobjekte fuer Bedienfelder mit Automatik,
+    WRG und Ein/Aus - und KO 29 als Ausgang, der sendet."""
+    print('13. Bedienfeld: Polarität Handbetrieb, Sommer, Zwangsobjekte')
+    img = aufbau_b(meta)
+    for n, v in {'ROOM_r1ManualPolarity': 1, 'ROOM_r1SummerPolarity': 1,
+                 'ROOM_r1ForcePolarity': 1, 'ROOM_r1Force1Mode': 7}.items():
+        img.set(n, v)
+    sent = []
+    core = Core(on_event=lambda ev: sent.append(ev) if ev.get('ev') == 'ko' else None)
+    core.cmd('load ' + img.hex())
+    core.cmd('v12 1')
+    core.cmd('bus 1')
+    core.cmd('ko 20 20.102 1')           # beide Raeume Komfort
+    core.cmd('ko 60 20.102 1')
+    core.cmd('run 5000')
+
+    ko29 = [e['val'] for e in sent if e['nr'] == 29]
+    check('KO 29 meldet nach dem Start "Automatik aktiv" = 1', bool(ko29) and ko29[-1] is True, ko29[-2:])
+    stage_before = core.state()['sim']['rooms'][0]['stage']
+
+    core.cmd('ko 29 1.1 0')              # Bedienfeld: Automatik aus
+    core.cmd('run 2000')
+    r = core.state()['sim']['rooms'][0]
+    check('Automatik aus: Handbetrieb mit der laufenden Stufe', r['source'] == '5 Hand' and r['stage'] == stage_before,
+          (r['source'], r['stage'], stage_before))
+    core.cmd('ko 29 1.1 1')              # Automatik ein
+    core.cmd('run 2000')
+    r = core.state()['sim']['rooms'][0]
+    check('Automatik ein: Raum wieder in der Automatik', r['source'] == '6 Automatik', r['source'])
+
+    core.cmd('ko 26 5.100 3')            # Stufe am Bedienfeld
+    core.cmd('run 2000')
+    ko29 = [e['val'] for e in sent if e['nr'] == 29]
+    check('Stufe vom Bedienfeld: KO 29 meldet Automatik = 0', bool(ko29) and ko29[-1] is False, ko29[-2:])
+
+    core.cmd('ko 30 1.1 0')              # WRG aus = Sommer
+    core.cmd('ko 70 1.1 1')              # Raum 2 (normale Polaritaet) auch Sommer -
+    core.cmd('run 2000')                 # sonst gewinnt im Verbund der kurze Zyklus
+    g = core.state()['sim']['groups'][0]
+    check('WRG = 0 waehlt den langen Zyklus', g['cycle'] == 3600, g['cycle'])
+    core.cmd('ko 30 1.1 1')              # WRG ein
+    core.cmd('run 2000')
+    g = core.state()['sim']['groups'][0]
+    check('WRG = 1 waehlt den kurzen Zyklus', g['cycle'] == 70, g['cycle'])
+
+    core.cmd('ko 23 1.1 0')              # Bedienfeld: Aus
+    core.cmd('run 2000')
+    r = core.state()['sim']['rooms'][0]
+    check('Aus (0) erzwingt Ruhe', r['mode'] == 'Ruhe' and r['stage'] == 0, (r['mode'], r['stage']))
+    core.cmd('ko 23 1.1 1')              # Ein
+    core.cmd('run 2000')
+    r = core.state()['sim']['rooms'][0]
+    check('Ein (1) nimmt den Zwang zurueck', r['mode'] != 'Ruhe', r['mode'])
+    core.close()
+
+
+def status_text(meta):
+    """Klartext-Status je Raum: Stufe und Grund in 14 Zeichen."""
+    print('14. Klartext-Status (KO 57)')
+    img = aufbau_b(meta)
+    img.set('ROOM_r1StatusText', 1)
+    sent = []
+    core = Core(on_event=lambda ev: sent.append(ev) if ev.get('ev') == 'ko' and ev['nr'] == 57 else None)
+    core.cmd('load ' + img.hex())
+    core.cmd('v12 1')
+    core.cmd('bus 1')
+    core.cmd('ko 20 20.102 1')
+    core.cmd('ko 60 20.102 1')
+    core.cmd('run 5000')
+    last = lambda: sent[-1]['val'] if sent else None
+    check('Start: Betriebsart auf der Grundstufe', bool(last()) and last().endswith('Komfort'), last())
+    core.cmd('ko 38 9.8 1400')            # CO2 ueber GW3
+    core.cmd('run 3000')
+    check('CO2 treibt: "S3 CO2"', last() == 'S3 CO2', last())
+    core.cmd('ko 26 5.100 2')
+    core.cmd('run 2000')
+    check('Hand: "S2 Hand"', last() == 'S2 Hand', last())
+    core.cmd('ko 33 1.1 1')               # Fenster
+    core.cmd('run 2000')
+    check('Sperre: "S0 Sperre"', last() == 'S0 Sperre', last())
+    core.cmd('ko 33 1.1 0')
+    core.cmd('ko 29 1.1 0')               # Handbetrieb beenden
+    core.cmd('ko 32 1.1 1')               # Abluftanforderung
+    core.cmd('run 3000')
+    check('Bad: "S4 Bad"', last() == 'S4 Bad', last())
+    core.cmd('ko 32 1.1 0')
+    core.cmd('ko 20 20.102 5')            # Stossluefte
+    core.cmd('run 960000')                # Bad-Nachlauf (15 min) abwarten
+    check('Stoßlüften mit Umlauten', last() == 'S4 Stoßlüften', last())
+    check('nur bei Änderung gesendet', len(sent) < 20, f'{len(sent)} Telegramme')
+    core.close()
+
+
+def overlay_feedback(meta):
+    """Rueckmeldung: Zwangsobjekte, Nacht und Zwangsbetriebsart
+    melden, wenn die Lueftung sie selbst beendet - nie beim Start, nie als Echo."""
+    print('15. Rückmeldung Zwangsobjekte, Nacht, Zwangsbetriebsart')
+    img = aufbau_b(meta)
+    for n, v in {'ROOM_r1ForcePolarity': 1, 'ROOM_r1ForceFeedback': 1,
+                 'ROOM_r1NightFeedback': 1}.items():
+        img.set(n, v)
+    sent = []
+    core = Core(on_event=lambda ev: sent.append(ev) if ev.get('ev') == 'ko' and 21 <= ev['nr'] <= 25
+                or ev.get('ev') == 'ko' and 61 <= ev['nr'] <= 65 else None)
+    nr = lambda k: [e['val'] for e in sent if e['nr'] == k]
+    core.cmd('load ' + img.hex())
+    core.cmd('v12 1')
+    core.cmd('bus 1')
+    core.cmd('ko 20 20.102 1')
+    core.cmd('ko 60 20.102 1')
+    core.cmd('run 5000')
+    check('Start: keine Rückmeldung gesendet', not sent, sent[:3])
+
+    core.cmd('ko 24 1.1 0')              # Bedienfeld Aus -> Zwangsobjekt 2 = Ruhe
+    core.cmd('run 2000')
+    r = core.state()['sim']['rooms'][0]
+    check('Zwangsobjekt 2 (0) erzwingt Ruhe, kein Echo', r['mode'] == 'Ruhe' and not nr(24), (r['mode'], nr(24)))
+
+    core.cmd('ko 22 1.1 1')              # Nacht setzt das Zwangsobjekt zurueck
+    core.cmd('run 2000')
+    check('Nacht beendet den Zwang: KO 24 meldet 1 (= Ein)', nr(24) == [True], nr(24))
+    check('Nacht selbst: kein Echo', not nr(22), nr(22))
+
+    core.cmd('ko 21 20.102 1')           # Zwangsbetriebsart Komfort setzt die Nacht zurueck
+    core.cmd('run 2000')
+    check('Zwangsbetriebsart beendet die Nacht: KO 22 meldet 0', nr(22) == [False], nr(22))
+    core.cmd('run 1800000')              # Laufzeit 30 min
+    check('Ablauf der Zwangsbetriebsart: KO 21 meldet 0', nr(21) == [0], nr(21))
+
+    core.cmd('ko 64 1.1 1')              # Raum 2 ohne Rueckmeldung
+    core.cmd('ko 62 1.1 1')
+    core.cmd('run 2000')
+    check('Raum 2 ohne Rückmeldung sendet nichts', not nr(64) and not nr(62), (nr(64), nr(62)))
+    check('insgesamt genau drei Rückmeldungen', len(sent) == 3, [(e['nr'], e['val']) for e in sent])
+    core.close()
+
+
+def config_faults(meta):
+    """Konfigurationsfehler je Luefter: doppelter oder fehlender
+    DAC-Kanal, Typ oder Kalibrierfaktor ausserhalb - Fehlercode 3, Kanal 5,00 V,
+    der andere Luefter laeuft weiter."""
+    print('16. Konfigurationsfehler: Kanal doppelt, Kanal fehlt, Typ, Kalibrierung')
+
+    def run(label, name, value, clamp=True, both=False):
+        img = aufbau_b(meta)
+        img.set(name, value, clamp=clamp)
+        core = Core()
+        core.cmd('load ' + img.hex())
+        core.cmd('v12 1')
+        core.cmd('bus 1')
+        core.cmd('run 3000')
+        core.cmd('ko 26 5.100 3')          # Raum 1 will Stufe 3
+        core.cmd('ko 66 5.100 3')          # Raum 2 auch
+        core.cmd('run 5000')
+        st = core.state()['sim']
+        core.close()
+        f1, f2, d = st['fans'][0]['err'], st['fans'][1]['err'], st['dac']
+        if both:
+            check(f'{label}: beide Luefter Fehlercode 3', f1 == 3 and f2 == 3, (f1, f2))
+            check(f'{label}: S1 bleibt auf 5,00 V', abs(d[0]['volt'] - 5.0) < 0.02, d[0]['volt'])
+        else:
+            check(f'{label}: Luefter 1 Fehlercode 3', f1 == 3, f1)
+            check(f'{label}: S1 bleibt auf 5,00 V', abs(d[0]['volt'] - 5.0) < 0.02, d[0]['volt'])
+            check(f'{label}: Luefter 2 laeuft weiter', f2 != 3 and abs(d[1]['volt'] - 5.0) > 0.5, (f2, d[1]['volt']))
+
+    run('Kanal doppelt (Luefter 2 auf S1)', 'FAN_f2Channel', 1, both=True)
+    run('Kalibrierfaktor 0', 'FAN_f1CalibGain', 0, clamp=False)
+    run('Lueftertyp 5', 'FAN_f1Type', 5, clamp=False)
+
+    img = aufbau_b(meta)
+    img.set('FAN_f1Channel', 5)             # jenseits der 4-Kanal-Platine
+    core = Core()
+    core.cmd('load ' + img.hex())
+    core.cmd('v12 1')
+    core.cmd('bus 1')
+    core.cmd('run 3000')
+    st = core.state()['sim']
+    core.close()
+    check('Kanal 5 auf 4-Kanal-Platine: Luefter 1 Fehlercode 3', st['fans'][0]['err'] == 3, st['fans'][0]['err'])
+    check('Kanal 5: Luefter 2 nicht betroffen', st['fans'][1]['err'] != 3, st['fans'][1]['err'])
+
+
+def mode_from_room1(meta):
+    """Betriebsart von Raum 1 uebernehmen: nur die Vorgabe aus dem
+    Objekt Betriebsart, nicht Nacht und Zwang von Raum 1 - sonst sendete der
+    Folgeraum mit Rueckmeldung Nacht = 0, obwohl dort niemand bedient hat."""
+    print('17. Betriebsart von Raum 1 uebernehmen')
+    img = aufbau_b(meta)
+    img.set('ROOM_r2ModeSource', 1)
+    img.set('ROOM_r2NightFeedback', 1)
+    sent = []
+    core = Core(on_event=lambda ev: sent.append(ev) if ev.get('ev') == 'ko' and ev['nr'] == 62 else None)
+    core.cmd('load ' + img.hex())
+    core.cmd('v12 1')
+    core.cmd('bus 1')
+    core.cmd('ko 20 20.102 1')             # Raum 1 Komfort -> Raum 2 folgt
+    core.cmd('run 3000')
+    rooms = lambda: core.state()['sim']['rooms']
+    check('Raum 2 folgt der Vorgabe Komfort', rooms()[1]['mode'] == 'Komfort', rooms()[1]['mode'])
+
+    core.cmd('ko 62 1.1 1')                # Nacht in Raum 2
+    core.cmd('run 2000')
+    check('Raum 2: Nacht', rooms()[1]['mode'] == 'Nacht/Eco', rooms()[1]['mode'])
+
+    core.cmd('ko 23 1.1 1')                # Zwangsobjekt 1 in Raum 1 = Stosslueften
+    core.cmd('run 2000')
+    r = rooms()
+    check('Raum 1: Stoßlüften', r[0]['mode'] == 'Stosslueften', r[0]['mode'])
+    check('Raum 2 bleibt in der Nacht', r[1]['mode'] == 'Nacht/Eco', r[1]['mode'])
+    check('Raum 2 sendet keine Nacht-Rückmeldung', not sent, [(e['nr'], e['val']) for e in sent])
+
+    core.cmd('ko 20 20.102 2')             # Vorgabe Standby: wie ein Telegramm in Raum 2
+    core.cmd('run 2000')
+    r = rooms()
+    check('Vorgabe Standby beendet die Nacht in Raum 2', r[1]['mode'] == 'Standby', r[1]['mode'])
+    check('Raum 2 meldet Nacht = 0', [e['val'] for e in sent] == [False], [(e['nr'], e['val']) for e in sent])
+    core.close()
+
+
+def dac_loss_reported(meta):
+    """12-V-Ausfall, wenn nur driveSafe() schreibt: der Fehler darf nicht nur in
+    der Ausgabeschicht stehen - das Modul meldet Code 4 statt 0 und erholt sich
+    nach der Wiederkehr."""
+    print('18. 12-V-Ausfall bei Lüftern ohne Verbund: gemeldet und erholt')
+    img = aufbau_b(meta)
+    img.set('FAN_f1Group', 3)              # beide ohne aktiven Verbund
+    img.set('FAN_f2Group', 3)
+    core = Core()
+    core.cmd('load ' + img.hex())
+    core.cmd('v12 1')
+    core.cmd('bus 1')
+    core.cmd('run 3000')
+    st = core.state()['sim']
+    check('Ausgang: beide Fehlercode 3', st['fans'][0]['err'] == 3 and st['fans'][1]['err'] == 3,
+          (st['fans'][0]['err'], st['fans'][1]['err']))
+    core.cmd('v12 0')
+    core.cmd('run 2000')
+    st = core.state()['sim']
+    check('12 V weg: Fehlercode 4 statt 0', st['fans'][0]['err'] == 4, st['fans'][0]['err'])
+    core.cmd('v12 1')
+    core.cmd('run 2000')
+    st = core.state()['sim']
+    check('12 V zurück: wieder Fehlercode 3', st['fans'][0]['err'] == 3, st['fans'][0]['err'])
+    check('12 V zurück: S1/S2 auf 5,00 V', abs(st['dac'][0]['volt'] - 5.0) < 0.02 and abs(st['dac'][1]['volt'] - 5.0) < 0.02,
+          (st['dac'][0]['volt'], st['dac'][1]['volt']))
+    core.close()
+
+
+def i2c_refresh(meta):
+    """I2C nur bei Aenderung oder alle 100 ms: im Beharrungszustand
+    hoechstens ~10 Frames je Sekunde und Luefter statt einem je Durchlauf."""
+    print('19. I2C-Last im Beharrungszustand')
+    img = aufbau_b(meta)
+    core = Core()
+    core.cmd('load ' + img.hex())
+    core.cmd('v12 1')
+    core.cmd('bus 1')
+    core.cmd('ko 20 20.102 1')
+    core.cmd('ko 60 20.102 1')
+    core.cmd('ko 30 1.1 1')                # Sommer: langer Zyklus, kein Wechsel in 10 s
+    core.cmd('ko 70 1.1 1')
+    core.cmd('run 15000')                  # Totzeit und Rampe des Anlaufs abwarten
+    before = core.state()['sim']['module']['i2cFrames']
+    core.cmd('run 10000')
+    st = core.state()['sim']
+    delta = st['module']['i2cFrames'] - before
+    check('hoechstens 400 I2C-Frames in 10 s (2 Luefter)', delta <= 400, delta)
+    check('mindestens 100 Frames: Auffrischung laeuft', delta >= 100, delta)
+    check('Luefter laufen dabei', abs(st['dac'][0]['volt'] - 5.0) > 0.5, st['dac'][0]['volt'])
+    core.close()
+
+
+def dac(core):
+    return [round(c['volt'], 2) for c in core.state()['sim']['dac']]
+
+
+def main():
+    try:
+        sys.stdout.reconfigure(encoding='utf-8')
+    except AttributeError:
+        pass
+    meta = load_meta()
+    core = Core()
+    warns = []
+    sent = []
+
+    def collect(ev):
+        if ev.get('ev') == 'warn':
+            warns.append(ev)
+        elif ev.get('ev') == 'ko':
+            sent.append(ev)
+    core.on_event = collect
+
+    print('1. Neues Board, KNX-Bus vor 12 V (Erstinbetriebnahme)')
+    core.cmd('bus 1')
+    core.cmd('run 1000')
+    core.cmd('v12 1')
+    core.cmd('run 20')
+    v = dac(core)
+    check('direkt nach 12 V ein: Werkswert 0 V', v[0] < 0.1, v)
+    core.cmd('run 400')
+    v = dac(core)
+    check('nach 0,4 s: 5,00 V an S1..S4', all(abs(x - 5.0) < 0.02 for x in v), v)
+
+    print('2. Programmieren (ETS-Download) mit Aufbau B')
+    core.cmd('pimg ' + aufbau_b(meta).hex())
+    core.cmd('ets 3000')
+    core.cmd('run 2000')
+    st = core.state()
+    check('nach dem Download parametriert', st['configured'])
+    check('zwei Lüfter aktiv', len(st['sim']['fans']) == 2, len(st['sim']['fans']))
+
+    print('3. Handstufe 2 in Raum 1, Komfort in beiden Räumen')
+    core.cmd('ko 20 20.102 1')
+    core.cmd('ko 60 20.102 1')
+    core.cmd('ko 26 5.100 2')
+    core.cmd('run 3000')
+    v = dac(core)
+    check('S1 und S2 in verschiedenen Hälften', (v[0] - 5) * (v[1] - 5) < 0, v)
+    rooms = core.state()['sim']['rooms']
+    check('Betriebsart Komfort über Objekt 20 kommt an', rooms[0]['mode'] == 'Komfort',
+          f"Raum 1: {rooms[0]['mode']} - mögliche Ursache: die KNX-Bibliothek dekodiert DPT 20.102 nicht")
+    st47 = [e['val'] for e in sent if e['nr'] == 47]
+    st48 = [e['val'] for e in sent if e['nr'] == 48]
+    check('Objekt 47 (Betriebsart Status) meldet 1 = Komfort', bool(st47) and st47[-1] == 1, st47[-3:])
+    check('Objekt 48 (HVAC-Status) meldet Bit 0 = Komfort', bool(st48) and st48[-1] == 1, st48[-3:])
+    fans = core.state()['sim']['fans']
+    check('beide Lüfter Stufe 2', [f['stage'] for f in fans] == [2, 2], [f['stage'] for f in fans])
+    dir348 = [e['val'] for e in sent if e['nr'] == 348]
+    check('Objekt 348 Richtung Status: 1 = Zuluft',
+          bool(dir348) and dir348[-1] == (fans[0]['dir'] == 'Zuluft'), (fans[0]['dir'], dir348[-2:]))
+
+    print('4. Pendeln über die Totzeit (70 s Zyklus)')
+    side0 = v[0] > 5
+    full0 = abs(v[0] - 5.0)
+    # Rampe 5 s (ETS-Vorgabe) vor und nach der Totzeit.
+    waited = 0
+    while waited < 80000 and core.state()['sim']['groups'][0]['ramp'] >= 0.999:
+        core.cmd('run 100')
+        waited += 100
+    core.cmd('run 2500')              # Mitte der Rampe nach unten
+    g = core.state()['sim']['groups'][0]
+    x = dac(core)
+    check('Rampe ab: halber Ausschlag, alte Seite',
+          abs(g['ramp'] - 0.5) < 0.05 and (x[0] > 5) == side0 and 0.3 * full0 < abs(x[0] - 5) < 0.7 * full0,
+          (g['ramp'], x))
+    waited = 0
+    while waited < 10000 and not core.state()['sim']['groups'][0]['inDeadTime']:
+        core.cmd('run 100')
+        waited += 100
+    check('Rampe dauert 5 s', 2300 <= waited <= 2700, f'{2500 + waited} ms bis 5,00 V')
+    x = dac(core)
+    check('Totzeit erreicht, beide Kanäle 5,00 V', abs(x[0] - 5.0) < 0.02 and abs(x[1] - 5.0) < 0.02, x)
+    dead = 0
+    while dead < 10000 and core.state()['sim']['groups'][0]['inDeadTime']:
+        core.cmd('run 100')
+        dead += 100
+    check('Totzeit dauert 2 s', 1900 <= dead <= 2100, f'{dead} ms')
+    core.cmd('run 2500')              # Mitte der Rampe nach oben
+    x = dac(core)
+    check('Rampe auf: neue Seite, halber Ausschlag',
+          (x[0] > 5) != side0 and 0.3 * full0 < abs(x[0] - 5) < 0.7 * full0, x)
+    core.cmd('run 2600')
+    v = dac(core)
+    # Stufe 2 liegt nicht symmetrisch um 5 V: 6,91 V Zuluft, 3,21 V Abluft.
+    check('danach getauscht, volle Stufe', (v[0] > 5) != side0 and min(abs(v[0] - 6.91), abs(v[0] - 3.21)) < 0.02, v)
+    fans = core.state()['sim']['fans']
+    check('Status in der Totzeit = laufende Stufe', fans[0]['stage'] == 2, fans[0]['stage'])
+    sent.clear()
+    core.cmd('run 140000')            # zwei Pendelwechsel
+    status = [e for e in sent if 346 <= e['nr'] <= 351]
+    check('Lüfter 1: höchstens 3 Statustelegramme je Pendelwechsel', len(status) <= 6,
+          f'{len(status)} in 140 s')
+
+    print('5. Sperre Raum 1 (Sperre im Verbund)')
+    core.cmd('ko 26 5.100 0')
+    core.cmd('ko 66 5.100 2')
+    core.cmd('ko 33 1.3 1')
+    core.cmd('run 3000')
+    fans = core.state()['sim']['fans']
+    check('Lüfter 1 steht (Stufe 0)', fans[0]['stage'] == 0, fans[0]['stage'])
+    check('Lüfter 2 läuft weiter (Stufe 2)', fans[1]['stage'] == 2, fans[1]['stage'])
+    core.cmd('ko 33 1.3 0')
+
+    print('6. Abluftanforderung Raum 1 gegen Standby-Deckel von Raum 2')
+    core.cmd('ko 66 5.100 0')
+    core.cmd('ko 60 20.102 2')
+    core.cmd('ko 32 1.3 1')
+    core.cmd('run 13000')             # Rampe ab 5 s, Totzeit 2 s, Rampe auf 5 s
+    fans = core.state()['sim']['fans']
+    check('Lüfter 1 Abluft Stufe 4', fans[0]['stage'] == 4 and fans[0]['dir'] == 'Abluft',
+          (fans[0]['stage'], fans[0]['dir']))
+    check('Lüfter 2 Zuluft, Verbundstufe', fans[1]['dir'] == 'Zuluft', (fans[1]['stage'], fans[1]['dir']))
+    core.cmd('ko 32 1.3 0')
+
+    print('6b. Feuchtevergleich: Code 7 nur mit Feuchteanforderung')
+    core.cmd('ko 35 9.1 18')          # innen 18 °C
+    core.cmd('ko 37 9.1 20')          # außen 20 °C, 80 % - feuchter als innen
+    core.cmd('ko 36 9.7 80')
+    core.cmd('ko 34 9.7 40')          # innen 40 %: keine Anforderung
+    core.cmd('run 3000')
+    r1 = core.state()['sim']['rooms'][0]
+    blk = [e['val'] for e in sent if e['nr'] == 51]
+    check('Objekt 51 meldet den Vergleich (sperrt)', bool(blk) and blk[-1] is True, blk[-2:])
+    check('ohne Anforderung kein Code 7', r1['err'] != 7, r1['err'])
+    core.cmd('ko 34 9.7 60')          # innen 60 %: über GW1 (50 %)
+    core.cmd('run 3000')
+    r1 = core.state()['sim']['rooms'][0]
+    check('mit Anforderung Code 7', r1['err'] == 7, r1['err'])
+
+    print('7. 12-V-Ausfall im Betrieb und Wiederkehr')
+    core.cmd('ko 26 5.100 3')
+    core.cmd('run 2000')
+    core.cmd('v12 0')
+    core.cmd('run 500')
+    st = core.state()
+    check('Fehlercode 4 an Lüfter 1', st['sim']['fans'][0]['err'] == 4, st['sim']['fans'][0]['err'])
+    n_i5 = sum(1 for w in warns if w['inv'] == 'Invariante 5')
+    core.cmd('v12 1')
+    core.cmd('run 600')
+    check('nach 12-V-Wiederkehr kein Richtungswechsel ohne Totzeit',
+          sum(1 for w in warns if w['inv'] == 'Invariante 5') == n_i5,
+          'Fehlerbild: 0 V (Werkswert) und danach sofort Stufe 4 in Gegenrichtung')
+    core.cmd('run 2000')
+    st = core.state()
+    check('Fehler weg nach Wiederkehr', st['sim']['module']['error'] == 0, st['sim']['module'])
+    # Nicht "Spannung > 0,5 V": unter 5 V ist Abluft, und Stufe 4
+    # Abluft des e²60 liegt bei 0,01 V. Der Werkswert ist Code 0 ohne Bereich.
+    d0 = st['sim']['dac'][0]
+    check('Ausgang neu geschrieben, nicht Werkswert', d0['wire'] != 0 and d0['range'] == 0x11, d0)
+    f0 = st['sim']['fans'][0]
+    check('Spannung passt zur Richtung (Polarität Standard)',
+          f0['stage'] == 0 or (d0['volt'] > 5.0) == (f0['dir'] == 'Zuluft'), (f0['stage'], f0['dir'], d0['volt']))
+
+    print('8. KNX-Bus weg, 12 V bleiben')
+    core.cmd('run 3000')
+    core.cmd('bus 0')
+    core.cmd('run 1000')
+    v = dac(core)
+    check('S1/S2 auf 5,00 V gehalten', abs(v[0] - 5) < 0.02 and abs(v[1] - 5) < 0.02, v)
+
+    core.close()
+    ego_summer(meta)
+    ego_boost(meta)
+    polarity(meta)
+    without_group(meta)
+    panel_polarity(meta)
+    status_text(meta)
+    overlay_feedback(meta)
+    config_faults(meta)
+    mode_from_room1(meta)
+    dac_loss_reported(meta)
+    i2c_refresh(meta)
+
+    print('Invariantenwächter:')
+    for w in warns:
+        print('  ', w['inv'], '-', w['text'])
+    if not warns:
+        print('   keine Meldung')
+
+    print()
+    print('ALLES OK' if not FAILS else f'{len(FAILS)} FEHLER: ' + '; '.join(FAILS))
+    return 1 if FAILS else 0
+
+
+if __name__ == '__main__':
+    sys.exit(main())

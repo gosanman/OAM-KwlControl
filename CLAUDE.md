@@ -1,0 +1,146 @@
+# CLAUDE.md — OAM-KwlControl / KNXFANDRV
+
+Diese Datei gilt in jeder Sitzung. Lies sie, bevor du Code änderst.
+
+## Was dieses Projekt ist
+
+OpenKNX-Firmware für eine KNX-Lüftersteuerung. Ein RP2040 steuert über einen
+galvanisch getrennten I²C-Bus zwei GP8413-DACs, die vier 0–10-V-Stellsignale für
+dezentrale Pendellüfter erzeugen (2 × e²60, 1 × ego mit zwei Motoren). Die
+Lüftungslogik liegt im Funktionsmodul OFM-KwlControl, eingebunden unter
+`lib/OFM-KwlControl`.
+
+## Sicherheitsinvarianten — gelten immer, ohne Ausnahme
+
+1. **5,00 V ist Stillstand. 0 V ist Volllast.** Das Stellsignal ist bipolar um 5 V.
+   Ein DAC-Code 0 ist kein „aus", sondern volle Drehzahl in Richtung A. Der sichere
+   Zustand jedes bipolaren Kanals ist der Code für 5,00 V; der eines unipolaren
+   Kanals (RA 15-60) ist 0.
+
+2. **Kein Ausgang ohne gemessenes Busformat.** `FANDRV_DAC_LEFT_ALIGNED` = **1**,
+   gemessen: `0x8000` ergibt 5,00 V, `0x4000` ergibt 2,50 V. Der Chip legt den Wert
+   linksbündig in ein 16-Bit-Register; der logische 15-Bit-Code geht um ein Bit
+   nach links. **Der sichere Zustand ist auf dem Bus `0x8000`, nicht `0x4000`.**
+   Die Messung steht mit Messwerten im Board-Header; sie wird nicht anhand eines
+   Datenblatts korrigiert.
+
+3. **Startup schreibt zuerst den Bereich, dann den sicheren Zustand.** Reihenfolge in
+   `setup()`: Register 0x01 = 0x11 an beide Chips → 5,00 V auf alle bipolaren Kanäle →
+   erst dann Sollwerte. Kein Codepfad darf einen Sollwert vor dem Bereichsregister
+   schreiben.
+
+4. **Codes werden geklemmt, nie überlaufen.** Volt → Code ist `round(v × 3276.7)`,
+   begrenzt auf 0…0x7FFF, dann erst der Formatschalter. Ein negativer oder zu großer
+   Zwischenwert ist ein Bug, kein Grenzfall.
+
+5. **Richtungswechsel nur über die Totzeit.** Zwischen zwei Richtungen liegt immer ein
+   Aufenthalt bei 5,00 V von mindestens der parametrierten Totzeit. Beim ego beide
+   Motoren gleichzeitig.
+
+6. **Der ego wird immer als Paar geschrieben.** Beide Motoren in einem I²C-Frame
+   (Register 0x02, vier Datenbytes, zwei verschiedene Werte). Niemals zwei getrennte
+   Schreibvorgänge für Motor 1 und Motor 2.
+
+7. **Kein EEPROM-Store. Die Firmware enthält keine Store-Sequenz.** Die
+   Store-Sequenz entsperrt **jeden** GP8413 am Bus, Frame 3 geht als roher
+   Bitstrom ohne ACK an alle, und ein Store hat einen nicht adressierten Chip
+   gemessen dauerhaft verstellt. Auf einem Bus mit zwei Chips ist die Sequenz
+   nicht sicher, und der Schaden ist nicht rückgängig zu machen. Die hingenommene,
+   dokumentierte Folge: Nach jedem Einschalten liegen an allen Kanälen die
+   Werkswerte 0 V = **Volllast** an, bis `setup()` den sicheren Zustand schreibt;
+   fehlt der KNX-Bus bei anliegenden 12 V, bleibt es dabei. Kein `kwl store`, kein
+   KO, kein ETS-Parameter dafür. Die Sequenz existiert nur noch in `test_dac`,
+   gesperrt hinter `FANDRV_TESTDAC_ALLOW_STORE`, für Versuche an der
+   Versuchsplatine 1.
+
+8. **Vor Neustart sicherer Zustand.** `processBeforeRestart()` schreibt 5,00 V auf
+   alle bipolaren Kanäle. Eine ETS-Neuprogrammierung darf keinen Vollgas-Moment
+   erzeugen.
+
+9. **Sperren schlagen alles, Schutz schlägt Bedienung.** Die wirksame Stufe entsteht
+   in genau einer Funktion `effectiveStage()` nach dieser Rangfolge: Sperre → Schutz
+   → Zu-/Abluftanforderung → Gruppe → Handstufe → Automatikstufe; darunter die
+   Betriebsart-Ebenen Zwangsobjekt 1…3 → Nacht → Zwangsbetriebsart → Betriebsart →
+   Standard. Rücksetzen: eine Nutzeraktion auf Rang ≥ 5 setzt höhere Ränge bis 5
+   zurück; Rang 1–4 nie. Kein zweiter Codepfad darf eine Stufe an dieser Funktion
+   vorbei ausgeben.
+
+10. **Ausfall wird gemeldet, nicht geraten.** Antwortet ein DAC nicht auf die
+   Adressabfrage, geht der Knoten auf Fehlercode, Alarm-Bit und rote LED. Kein
+   stilles Weiterrechnen.
+
+## Regeln für die Arbeit
+
+- **Tests zuerst** für reine Logik: `KwlCurve`, `CableComp`, Stufenabbildung,
+  Takt-Zustandsmaschine. `pio test -e native` muss grün sein, bevor Hardware-Code
+  angefasst wird. Das ist die Schicht, in der ein Fehler einen Lüfter auf Vollgas
+  stellt, und die einzige ohne Hardware prüfbare.
+- **Vor jedem Flash-Vorschlag beantworte:** „Welcher Ausgangszustand liegt an, wenn
+  diese Firmware startet, und woher weiß ich das aus dem Code?" Kannst du das nicht
+  aus dem Code herleiten, ist der Code nicht fertig.
+- **Quellenrangfolge bei Widersprüchen:** gemessen > Herstellerbibliothek >
+  Pintabelle/DC-Tabelle des Datenblatts > Merkmalsliste > Applikationsbild. Die
+  Datenblätter der GP8403/GP8413 enthalten bekannte Widersprüche. Korrigiere nie
+  eine Messung anhand eines Datenblatts.
+- **Richtung heißt Zuluft/Abluft, nicht A/B.** Welche Spannungshälfte welche ist,
+  legt der ETS-Parameter „Polarität“ **je Lüfter** fest. Standard: **über 5 V
+  Zuluft, unter 5 V Abluft** — 10 V = Zuluft voll, 0 V = Abluft voll. Modulcode
+  rechnet in Zuluft/Abluft, nur `KwlCurve` übersetzt in Spannungshälften.
+- **WRG ist die Pendelbewegung.** Kurzer Zyklus (70 s) = WRG, langer Zyklus (1 h,
+  Sommer) = praktisch ohne WRG, aber weiter wechselnd. Feste Richtung nur auf
+  ausdrückliche Betriebsweise-Vorgabe. Beim ego ist WRG in Stufe 1–3 immer aktiv.
+- **Stufen-KOs sind DPT 5.100**, nicht 5.010. Führungen (rF, CO₂) laufen über die
+  Grenzwert-Treppe `StageLadder`, nicht über einen Prozent-Regler.
+- **Prozent ist Eingabeformat, Stufe ist Wahrheit.** Intern rechnet alles in Stufen
+  0…4 und Volt. Prozent-KOs werden am Rand in Stufen übersetzt (mit Hysterese) und
+  nie weiter nach innen gereicht.
+- **Keine Pins, Adressen oder Kennlinien im Modulcode.** Pins und I²C-Adressen leben im
+  Board-Header `include/KnxFanDrv_Rev01.h` — auch die OpenKNX-Systempins (KNX-UART,
+  PROG, SAVE, LEDs), denn OGM-HardwareConfig wird nicht eingebunden. Kennlinien-
+  Vorgaben leben in `KwlCurve` und sind ETS-überschreibbar.
+- **Kompiliert wird das Maximum, sichtbar ist die Auswahl.** 8 Räume, 12 Lüfter,
+  8 Verbünde sind die Compile-Zeit-Obergrenzen. Die ETS blendet Räume über
+  die Kanalaktivität und Lüfter zusätzlich über die Hardwareauswahl `FAN_Hardware` ein.
+  Ausgeblendete Kanäle laufen nicht. Beim Start wird `FAN_Hardware` gegen
+  `FANDRV_BOARD_ID` geprüft; bei Abweichung Fehlercode 3 an allen Lüftern und
+  5,00 V — niemals stilles Weiterlaufen mit falscher Platine. Der Enum-Wert von
+  `FAN_Hardware` ist die **Platinenkennung**, nicht die Kanalzahl (zwei Platinen mit
+  gleicher Kanalzahl müssen unterscheidbar bleiben); die Kanalzahl für die
+  Sichtbarkeit setzt die ETS per `Assign` in den internen Parameter
+  `FAN_HardwareChannels`.
+- **Drei Ebenen, nicht eine.** Raum (Sensoren, Betriebsarten, Führungen) → Verbund
+  (Stufenregel, Takt) → Lüfter (Antrieb). Ein Lüfter gehört zu genau einem Raum und
+  einem Verbund. Raumlogik gehört in `KwlRoom`, Antrieb in `KwlFan`, die Regel
+  dazwischen in `KwlGroup`. `KwlFanModule` liest Raumanforderungen in-process,
+  nie über den Bus.
+- **Netznamen und Bezeichner wie auf der Platine.** S1…S4, CH1_12V, GPIO2/GPIO3,
+  U2 = 0x58, U3 = 0x59. Kanal → DAC-Ausgang: S1 = U2.VOUT0, S2 = U2.VOUT1,
+  S3 = U3.VOUT0, S4 = U3.VOUT1. **VOUT0 ist Pin 8, VOUT1 ist Pin 7** — nicht
+  aufsteigend.
+
+## Was du nicht tust
+
+- **Kein Commit ohne ausdrückliche Freigabe.** Änderungen werden geschrieben, gebaut,
+  geprüft und berichtet — committet wird erst, wenn der Mensch es in derselben
+  Nachricht verlangt. Das gilt für beide Repositories, für `git add` auf Vorrat und
+  für jedes „damit es nicht verloren geht". Kein `git push`, kein Branch, kein Tag,
+  kein `git commit --amend`, kein Verwerfen von Änderungen des Menschen.
+- Keine Kommandos an die Hardware, die der Mensch nicht angefordert hat.
+- Kein `store`, kein Flashen, kein `pio run -t upload` ohne ausdrückliche Aufforderung
+  in derselben Nachricht.
+- Keine Änderung an `FANDRV_DAC_LEFT_ALIGNED`, es sei denn der Mensch nennt den
+  Messwert und das Datum der Messung.
+- Keine Erweiterung des KO-Layouts ohne Fortschreiben des KoOffset-Plans. KoOffsets
+  und Blockgrößen sind eingefroren: ein überlaufender Block trifft auf das nächste
+  Modul.
+
+## Build
+
+```
+OpenKNXproducer create --Debug -h include/knxprod.h src/Kwl    (Windows, ETS nötig)
+pio run -e develop_KnxFanDrv
+pio test -e native                                                 (im OFM-Repo)
+```
+
+Die Messfirmware `test_dac` baut ohne knxprod und ohne OGM-Common:
+`pio run -e test_dac`.
